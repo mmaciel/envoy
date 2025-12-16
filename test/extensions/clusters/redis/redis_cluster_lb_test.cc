@@ -8,6 +8,7 @@
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/priority_set.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/test_runtime.h"
 
 using testing::Return;
 
@@ -602,6 +603,212 @@ TEST_F(RedisLoadBalancerContextImplTest, EnforceHashTag) {
   EXPECT_EQ(absl::optional<uint64_t>(44950), context2.computeHashKey());
   EXPECT_EQ(false, context2.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context2.readPolicy());
+}
+
+// Tests for CLUSTER NODES feature behavior (when envoy.reloadable_features.redis_use_cluster_nodes
+// is enabled)
+class RedisClusterNodesLoadBalancerTest : public RedisClusterLoadBalancerTest {
+public:
+  void SetUp() override {
+    // Enable the CLUSTER NODES runtime feature
+    scoped_runtime_.mergeValues(
+        {{"envoy.reloadable_features.redis_use_cluster_nodes", "true"}});
+  }
+
+protected:
+  TestScopedRuntime scoped_runtime_;
+};
+
+// Test that write requests fail when primary is unhealthy with use_cluster_nodes enabled.
+// This is the key behavior difference: CLUSTER NODES returns health info that prevents
+// writes to unhealthy primaries.
+TEST_F(RedisClusterNodesLoadBalancerTest, WriteFailsWhenPrimaryUnhealthy) {
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 2000, hosts[0]->address()),
+      ClusterSlot(2001, 16383, hosts[1]->address()),
+  });
+  slots->at(0).addReplica(hosts[2]->address());
+  slots->at(1).addReplica(hosts[3]->address());
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Mark the first primary as unhealthy
+  hosts[0]->healthFlagSet(Upstream::Host::HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+
+  // Write commands should return nullptr for shard with unhealthy primary
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // Hash 0 maps to shard 0 which has unhealthy primary
+  TestLoadBalancerContext context(0, false, NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
+  auto result = lb->chooseHost(&context);
+  EXPECT_EQ(nullptr, result.host);
+
+  // Hash 2001 maps to shard 1 which has healthy primary
+  TestLoadBalancerContext context2(2001, false, NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
+  auto result2 = lb->chooseHost(&context2);
+  EXPECT_NE(nullptr, result2.host);
+  EXPECT_EQ(hosts[1]->address()->asString(), result2.host->address()->asString());
+}
+
+// Test that read requests still work even when primary is unhealthy with use_cluster_nodes enabled
+TEST_F(RedisClusterNodesLoadBalancerTest, ReadSucceedsWhenPrimaryUnhealthy) {
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 2000, hosts[0]->address()),
+      ClusterSlot(2001, 16383, hosts[1]->address()),
+  });
+  slots->at(0).addReplica(hosts[2]->address());
+  slots->at(1).addReplica(hosts[3]->address());
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Mark the first primary as unhealthy
+  hosts[0]->healthFlagSet(Upstream::Host::HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // Read with Replica policy should still succeed by using the replica
+  TestLoadBalancerContext replica_context(0, true,
+                                          NetworkFilters::Common::Redis::Client::ReadPolicy::Replica);
+  auto replica_result = lb->chooseHost(&replica_context);
+  EXPECT_NE(nullptr, replica_result.host);
+  EXPECT_EQ(hosts[2]->address()->asString(), replica_result.host->address()->asString());
+
+  // Read with PreferReplica should succeed
+  TestLoadBalancerContext prefer_replica_context(
+      0, true, NetworkFilters::Common::Redis::Client::ReadPolicy::PreferReplica);
+  auto prefer_replica_result = lb->chooseHost(&prefer_replica_context);
+  EXPECT_NE(nullptr, prefer_replica_result.host);
+  EXPECT_EQ(hosts[2]->address()->asString(), prefer_replica_result.host->address()->asString());
+}
+
+// Test that all read strategies work correctly with unhealthy primary
+TEST_F(RedisClusterNodesLoadBalancerTest, AllReadStrategiesWithUnhealthyPrimary) {
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),  // primary 0
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),  // primary 1
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),  // replica 0
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),  // replica 1
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 2000, hosts[0]->address()),
+      ClusterSlot(2001, 16383, hosts[1]->address()),
+  });
+  slots->at(0).addReplica(hosts[2]->address());
+  slots->at(1).addReplica(hosts[3]->address());
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Mark primary 0 as unhealthy
+  hosts[0]->healthFlagSet(Upstream::Host::HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // Test PreferPrimary - should fall back to replica when primary is unhealthy
+  TestLoadBalancerContext prefer_primary_context(
+      0, true, NetworkFilters::Common::Redis::Client::ReadPolicy::PreferPrimary);
+  auto prefer_primary_result = lb->chooseHost(&prefer_primary_context);
+  EXPECT_NE(nullptr, prefer_primary_result.host);
+  EXPECT_EQ(hosts[2]->address()->asString(), prefer_primary_result.host->address()->asString());
+
+  // Test Any policy - should use replica when primary is unhealthy
+  ON_CALL(random_, random()).WillByDefault(Return(0));
+  TestLoadBalancerContext any_context(0, true,
+                                      NetworkFilters::Common::Redis::Client::ReadPolicy::Any);
+  auto any_result = lb->chooseHost(&any_context);
+  EXPECT_NE(nullptr, any_result.host);
+  // With unhealthy primary, Any should prefer the replica
+  EXPECT_EQ(hosts[2]->address()->asString(), any_result.host->address()->asString());
+}
+
+// Test write behavior when primary is healthy (should still work)
+TEST_F(RedisClusterNodesLoadBalancerTest, WriteSucceedsWhenPrimaryHealthy) {
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 2000, hosts[0]->address()),
+      ClusterSlot(2001, 16383, hosts[1]->address()),
+  });
+  Upstream::HostMap all_hosts{
+      {hosts[0]->address()->asString(), hosts[0]},
+      {hosts[1]->address()->asString(), hosts[1]},
+  };
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Both primaries are healthy
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // Write to shard 0
+  TestLoadBalancerContext context(0, false, NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
+  auto result = lb->chooseHost(&context);
+  EXPECT_NE(nullptr, result.host);
+  EXPECT_EQ(hosts[0]->address()->asString(), result.host->address()->asString());
+
+  // Write to shard 1
+  TestLoadBalancerContext context2(2001, false, NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
+  auto result2 = lb->chooseHost(&context2);
+  EXPECT_NE(nullptr, result2.host);
+  EXPECT_EQ(hosts[1]->address()->asString(), result2.host->address()->asString());
+}
+
+// Test behavior without the runtime flag (original behavior)
+TEST_F(RedisClusterLoadBalancerTest, WriteSucceedsWithUnhealthyPrimaryWithoutFlag) {
+  // This test ensures the original behavior is preserved when the flag is disabled
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 2000, hosts[0]->address()),
+      ClusterSlot(2001, 16383, hosts[1]->address()),
+  });
+  Upstream::HostMap all_hosts{
+      {hosts[0]->address()->asString(), hosts[0]},
+      {hosts[1]->address()->asString(), hosts[1]},
+  };
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Mark primary as unhealthy
+  hosts[0]->healthFlagSet(Upstream::Host::HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // Without the flag, writes still return the primary (original behavior)
+  TestLoadBalancerContext context(0, false, NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
+  auto result = lb->chooseHost(&context);
+  // Original behavior allows writes to unhealthy primary
+  EXPECT_NE(hosts[0], result.host);
+  EXPECT_EQ(hosts[0]->address()->asString(), result.host->address()->asString());
 }
 
 } // namespace Redis

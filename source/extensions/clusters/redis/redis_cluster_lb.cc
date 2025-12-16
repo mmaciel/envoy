@@ -142,6 +142,7 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
   }
 
   RedisShardSharedPtr shard;
+
   if (dynamic_cast<const RedisSpecifyShardContextImpl*>(context)) {
     if (hash.value() < shard_vector_->size()) {
       shard = shard_vector_->at(hash.value());
@@ -149,8 +150,7 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
       return {nullptr};
     }
   } else {
-    shard = shard_vector_->at(
-        slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
+    shard = shard_vector_->at(slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
   }
 
   auto redis_context = dynamic_cast<RedisLoadBalancerContext*>(context);
@@ -176,6 +176,13 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
       return chooseRandomHost(shard->allHosts(), random_);
     }
   }
+
+  // Fail in case the shard is in fail state. We can read from replicas but writing would fail otherwise.
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_use_cluster_nodes") && 
+        shard->primary()->coarseHealth() == Upstream::Host::Health::Unhealthy) {
+    return {nullptr};
+  }
+
   return shard->primary();
 }
 

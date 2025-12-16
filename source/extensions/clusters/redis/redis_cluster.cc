@@ -9,6 +9,9 @@
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.validate.h"
 
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_contains.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace Clusters {
@@ -363,8 +366,13 @@ void RedisCluster::RedisDiscoverySession::startResolveRedis() {
         parent_.auth_username_, parent_.auth_password_, false, absl::nullopt, absl::nullopt);
     client->client_->addConnectionCallbacks(*client);
   }
-  ENVOY_LOG(debug, "executing redis cluster slot request for '{}'", parent_.info_->name());
-  current_request_ = client->client_->makeRequest(ClusterSlotsRequest::instance_, *this);
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_use_cluster_nodes")) {
+    ENVOY_LOG(debug, "executing redis cluster nodes request for '{}'", parent_.info_->name());
+    current_request_ = client->client_->makeRequest(ClusterNodesRequest::instance_, *this);
+  } else {
+    ENVOY_LOG(debug, "executing redis cluster slots request for '{}'", parent_.info_->name());
+    current_request_ = client->client_->makeRequest(ClusterSlotsRequest::instance_, *this);
+  }  
 }
 
 void RedisCluster::RedisDiscoverySession::updateDnsStats(
@@ -509,86 +517,278 @@ void RedisCluster::RedisDiscoverySession::onResponse(
   const uint32_t SlotPrimary = 2;
   const uint32_t SlotReplicaStart = 3;
 
-  // Do nothing if the cluster is empty.
-  if (value->type() != NetworkFilters::Common::Redis::RespType::Array || value->asArray().empty()) {
-    onUnexpectedResponse(value);
-    return;
-  }
-
   auto cluster_slots = std::make_shared<std::vector<ClusterSlot>>();
-
-  // https://redis.io/commands/cluster-slots
-  // CLUSTER SLOTS represents nested array of redis instances, like this:
-  //
-  // 1) 1) (integer) 0                                      <-- start slot range
-  //    2) (integer) 5460                                   <-- end slot range
-  //
-  //    3) 1) "127.0.0.1"                                   <-- primary slot IP ADDR(HOSTNAME)
-  //       2) (integer) 30001                               <-- primary slot PORT
-  //       3) "09dbe9720cda62f7865eabc5fd8857c5d2678366"
-  //
-  //    4) 1) "127.0.0.2"                                   <-- replica slot IP ADDR(HOSTNAME)
-  //       2) (integer) 30004                               <-- replica slot PORT
-  //       3) "821d8ca00d7ccf931ed3ffc7e3db0599d2271abf"
-  //
-  // Loop through the cluster slot response and error checks for each field.
   auto hostname_resolution_required_cnt = std::make_shared<std::uint64_t>(0);
-  for (const NetworkFilters::Common::Redis::RespValue& part : value->asArray()) {
-    if (part.type() != NetworkFilters::Common::Redis::RespType::Array) {
+
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_use_cluster_nodes")) {
+    // https://redis.io/commands/cluster-nodes
+    // CLUSTER NODES represents array of cluster nodes, like this:
+    //
+    // 07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1:30004@31004,hostname4 slave e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 0 1426238317239 4 connected
+    // 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1:30002@31002,hostname2 master - 0 1426238316232 2 connected 5461-10922 
+    // 292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 127.0.0.1:30003@31003,hostname3 master - 0 1426238318243 3 connected 10923-16383
+    // 6ec23923021cf3ffec47632106199cb7f496ce01 127.0.0.1:30005@31005,hostname5 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 0 1426238316232 5 connected    
+    // 824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006@31006,hostname6 slave 292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 0 1426238317741 6 connected
+    // e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:30001@31001,hostname1 myself,master - 0 0 1 connected 0-5460
+    //
+    // CLUSTER NODES returns a bulk string containing text lines
+    if (value->type() != NetworkFilters::Common::Redis::RespType::BulkString) {
       onUnexpectedResponse(value);
       return;
     }
 
-    // Row 1-2: Slot ranges
-    const std::vector<NetworkFilters::Common::Redis::RespValue>& slot_range = part.asArray();
-    if (slot_range.size() < 3 ||
-        slot_range[SlotRangeStart].type() !=
-            NetworkFilters::Common::Redis::RespType::Integer || // Start slot range is an
-                                                                // integer.
-        slot_range[SlotRangeEnd].type() !=
-            NetworkFilters::Common::Redis::RespType::Integer) { // End slot range is an
-                                                                // integer.
+    const std::string& nodes_response = value->asString();
+
+    auto parseNodeAddress = [](absl::string_view addr_str, std::string& host_out,
+                               uint16_t& port_out) -> bool {
+      // Split by comma to separate hostname if present: "IP:Port@BusPort,Hostname"
+      auto comma_parts = StringUtil::splitToken(addr_str, ",");
+      if (comma_parts.empty()) {
+        return false;
+      }
+      absl::string_view addr_part = comma_parts[0];
+
+      // Split by @ to remove cluster bus port
+      auto at_parts = StringUtil::splitToken(addr_part, "@");
+      if (at_parts.empty()) {
+        return false;
+      }
+      addr_part = at_parts[0];
+
+      // Find last colon to get IP/hostname and port (rfind for IPv6 support)
+      size_t colon_pos = addr_part.rfind(':');
+      if (colon_pos == absl::string_view::npos) {
+        return false;
+      }
+
+      host_out = std::string(addr_part.substr(0, colon_pos));
+
+      uint32_t port;
+      if (!absl::SimpleAtoi(addr_part.substr(colon_pos + 1), &port) || port > 0xffff) {
+        return false;
+      }
+      port_out = static_cast<uint16_t>(port);
+      return true;
+    };
+
+    // Map node_id to indices in cluster_slots where this master's slots are located
+    absl::flat_hash_map<absl::string_view, std::vector<size_t>> master_slot_indices;
+    // Map master_id to pending replicas (for slaves seen before their master)
+    absl::flat_hash_map<absl::string_view, std::vector<std::pair<std::string, uint16_t>>>
+        pending_replicas;
+
+    for (absl::string_view line : StringUtil::splitToken(nodes_response, "\r\n")) {
+      if (line.empty()) {
+        continue;
+      }
+
+      // 0: node_id, 1: address, 2: flags, 3: master_id, 4: ping_sent,
+      // 5: pong_recv, 6: config_epoch, 7: link_state, 8+: slot ranges
+      std::vector<absl::string_view> fields = StringUtil::splitToken(line, " \t");
+
+      if (fields.size() < 8) {
+        ENVOY_LOG(warn, "redis cluster nodes: malformed line with {} fields: {}", fields.size(),
+                  line);
+        continue;
+      }
+
+      absl::string_view node_id = fields[0];
+      absl::string_view address = fields[1];
+      absl::string_view flags = fields[2];
+      absl::string_view master_id = fields[3];
+
+      std::string host;
+      uint16_t port;
+      if (!parseNodeAddress(address, host, port)) {
+        ENVOY_LOG(warn, "redis cluster nodes: invalid address: {}", address);
+        continue;
+      }
+
+      bool healthy_node = true;
+      size_t last_comma = flags.rfind(',');
+      absl::string_view last_flag = flags;
+
+      if (last_comma != absl::string_view::npos) {
+        last_flag = flags.substr(last_comma + 1);
+      }
+
+      if (last_flag == "fail" || last_flag == "handshake" || last_flag == "noaddr") {
+        ENVOY_LOG(warn, "redis cluster nodes: skipping master node {} with flags: {}", node_id,
+                  flags);
+        healthy_node = false;
+      }
+
+      if (absl::StrContains(flags, "master")) {        
+        absl::string_view last_flag = flags;
+
+        for (size_t i = 8; i < fields.size(); ++i) {
+          absl::string_view slot_field = fields[i];
+
+          int64_t start, end;
+          size_t dash_pos = slot_field.find('-');
+
+          if (dash_pos != absl::string_view::npos) {
+            // Range format: "start-end"
+            if (!absl::SimpleAtoi(slot_field.substr(0, dash_pos), &start) ||
+                !absl::SimpleAtoi(slot_field.substr(dash_pos + 1), &end)) {
+              ENVOY_LOG(warn, "redis cluster nodes: invalid slot range: {}", slot_field);
+              continue;
+            }
+          } else {
+            // Single slot
+            if (!absl::SimpleAtoi(slot_field, &start)) {
+              ENVOY_LOG(warn, "redis cluster nodes: invalid slot: {}", slot_field);
+              continue;
+            }
+            end = start;
+          }
+
+          auto primary_address = Network::Utility::parseInternetAddressNoThrow(host, port, false);
+          ClusterSlot slot(start, end, primary_address);
+
+          // Setting health to unhealthy to prevent further calls into this primary.
+          slot->primary()->coarseHealth(healthy_node ? Upstream::Host::Health::Healthy : Upstream::Host::Health::Unhealthy);
+
+          if (slot.primary() == nullptr) {
+            // Address is potentially a hostname, save it for async DNS resolution
+            slot.primary_hostname_ = host;
+            slot.primary_port_ = port;
+            (*hostname_resolution_required_cnt)++;
+          }
+
+          // Track where this master's slots are in the vector
+          master_slot_indices[node_id].push_back(cluster_slots->size());
+          cluster_slots->push_back(std::move(slot));
+        }
+
+        // Add any pending replicas for this master that were seen before this master
+        auto pending_it = pending_replicas.find(node_id);
+        if (pending_it != pending_replicas.end()) {
+          for (const auto& [replica_host, replica_port] : pending_it->second) {
+            for (size_t slot_idx : master_slot_indices[node_id]) {
+              auto& slot = (*cluster_slots)[slot_idx];
+
+              auto replica_address =
+                  Network::Utility::parseInternetAddressNoThrow(replica_host, replica_port, false);
+              if (replica_address) {
+                slot.addReplica(std::move(replica_address));
+              } else {
+                slot.addReplicaToResolve(replica_host, replica_port);
+                (*hostname_resolution_required_cnt)++;
+              }
+            }
+          }
+          pending_replicas.erase(pending_it);
+        }
+      } else if (absl::StrContains(flags, "slave")) {
+        auto master_it = master_slot_indices.find(master_id);
+        if (master_it != master_slot_indices.end()) {
+          // Master already seen, add replica immediately to all its slots
+          for (size_t slot_idx : master_it->second) {
+            auto& slot = (*cluster_slots)[slot_idx];
+
+            auto replica_address = Network::Utility::parseInternetAddressNoThrow(host, port, false);
+            if (replica_address) {
+              slot.addReplica(std::move(replica_address));
+            } else {
+              slot.addReplicaToResolve(host, port);
+              (*hostname_resolution_required_cnt)++;
+            }
+          }
+        } else {
+          // Master not yet seen, defer adding this replica
+          pending_replicas[master_id].emplace_back(host, port);
+        }
+      }
+    }
+
+    // Log warning for any replicas whose masters were never seen
+    if (!pending_replicas.empty()) {
+      for (const auto& [master_id, replicas] : pending_replicas) {
+        ENVOY_LOG(warn, "redis cluster nodes: {} replica(s) reference unknown master: {}",
+                  replicas.size(), master_id);
+      }
+    }
+  } else {
+    // https://redis.io/commands/cluster-slots
+    // CLUSTER SLOTS represents nested array of redis instances, like this:
+    //
+    // 1) 1) (integer) 0                                      <-- start slot range
+    //    2) (integer) 5460                                   <-- end slot range
+    //
+    //    3) 1) "127.0.0.1"                                   <-- primary slot IP ADDR(HOSTNAME)
+    //       2) (integer) 30001                               <-- primary slot PORT
+    //       3) "09dbe9720cda62f7865eabc5fd8857c5d2678366"
+    //
+    //    4) 1) "127.0.0.2"                                   <-- replica slot IP ADDR(HOSTNAME)
+    //       2) (integer) 30004                               <-- replica slot PORT
+    //       3) "821d8ca00d7ccf931ed3ffc7e3db0599d2271abf"
+    //
+    // CLUSTER SLOTS returns an array
+    if (value->type() != NetworkFilters::Common::Redis::RespType::Array ||
+        value->asArray().empty()) {
       onUnexpectedResponse(value);
       return;
     }
 
-    // Row 3: Primary slot address
-    if (!validateCluster(slot_range[SlotPrimary])) {
-      onUnexpectedResponse(value);
-      return;
-    }
-    // Try to parse primary slot address as IP address
-    // It may fail in case the address is a hostname. If this is the case - we'll come back later
-    // and try to resolve hostnames asynchronously. For example, AWS ElastiCache returns hostname
-    // instead of IP address.
-    ClusterSlot slot(slot_range[SlotRangeStart].asInteger(), slot_range[SlotRangeEnd].asInteger(),
-                     ipAddressFromClusterEntry(slot_range[SlotPrimary].asArray()));
-    if (slot.primary() == nullptr) {
-      // Primary address is potentially a hostname, save it for async DNS resolution.
-      const auto& array = slot_range[SlotPrimary].asArray();
-      slot.primary_hostname_ = array[0].asString();
-      slot.primary_port_ = array[1].asInteger();
-      (*hostname_resolution_required_cnt)++;
-    }
-
-    // Row 4-N: Replica(s) addresses
-    for (auto replica = std::next(slot_range.begin(), SlotReplicaStart);
-         replica != slot_range.end(); ++replica) {
-      if (!validateCluster(*replica)) {
+    // Loop through the cluster slot response and error checks for each field.
+    for (const NetworkFilters::Common::Redis::RespValue& part : value->asArray()) {
+      if (part.type() != NetworkFilters::Common::Redis::RespType::Array) {
         onUnexpectedResponse(value);
         return;
       }
-      auto replica_address = ipAddressFromClusterEntry(replica->asArray());
-      if (replica_address) {
-        slot.addReplica(std::move(replica_address));
-      } else {
-        // Replica address is potentially a hostname, save it for async DNS resolution.
-        const auto& array = replica->asArray();
-        slot.addReplicaToResolve(array[0].asString(), array[1].asInteger());
+
+      // Row 1-2: Slot ranges
+      const std::vector<NetworkFilters::Common::Redis::RespValue>& slot_range = part.asArray();
+      if (slot_range.size() < 3 ||
+          slot_range[SlotRangeStart].type() !=
+              NetworkFilters::Common::Redis::RespType::Integer || // Start slot range is an
+                                                                  // integer.
+          slot_range[SlotRangeEnd].type() !=
+              NetworkFilters::Common::Redis::RespType::Integer) { // End slot range is an
+                                                                  // integer.
+        onUnexpectedResponse(value);
+        return;
+      }
+
+      // Row 3: Primary slot address
+      if (!validateCluster(slot_range[SlotPrimary])) {
+        onUnexpectedResponse(value);
+        return;
+      }
+      // Try to parse primary slot address as IP address
+      // It may fail in case the address is a hostname. If this is the case - we'll come back later
+      // and try to resolve hostnames asynchronously. For example, AWS ElastiCache returns hostname
+      // instead of IP address.
+      ClusterSlot slot(slot_range[SlotRangeStart].asInteger(), slot_range[SlotRangeEnd].asInteger(),
+                       ipAddressFromClusterEntry(slot_range[SlotPrimary].asArray()));
+      if (slot.primary() == nullptr) {
+        // Primary address is potentially a hostname, save it for async DNS resolution.
+        const auto& array = slot_range[SlotPrimary].asArray();
+        slot.primary_hostname_ = array[0].asString();
+        slot.primary_port_ = array[1].asInteger();
         (*hostname_resolution_required_cnt)++;
       }
+
+      // Row 4-N: Replica(s) addresses
+      for (auto replica = std::next(slot_range.begin(), SlotReplicaStart);
+           replica != slot_range.end(); ++replica) {
+        if (!validateCluster(*replica)) {
+          onUnexpectedResponse(value);
+          return;
+        }
+        auto replica_address = ipAddressFromClusterEntry(replica->asArray());
+        if (replica_address) {
+          slot.addReplica(std::move(replica_address));
+        } else {
+          // Replica address is potentially a hostname, save it for async DNS resolution.
+          const auto& array = replica->asArray();
+          slot.addReplicaToResolve(array[0].asString(), array[1].asInteger());
+          (*hostname_resolution_required_cnt)++;
+        }
+      }
+      cluster_slots->push_back(std::move(slot));
     }
-    cluster_slots->push_back(std::move(slot));
   }
 
   if (*hostname_resolution_required_cnt > 0) {
@@ -644,6 +844,7 @@ void RedisCluster::RedisDiscoverySession::onFailure() {
 }
 
 RedisCluster::ClusterSlotsRequest RedisCluster::ClusterSlotsRequest::instance_;
+RedisCluster::ClusterNodesRequest RedisCluster::ClusterNodesRequest::instance_;
 
 absl::StatusOr<std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>>
 RedisClusterFactory::createClusterWithConfig(

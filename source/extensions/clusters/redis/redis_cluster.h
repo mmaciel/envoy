@@ -113,6 +113,21 @@ public:
     static ClusterSlotsRequest instance_;
   };
 
+  struct ClusterNodesRequest : public Extensions::NetworkFilters::Common::Redis::RespValue {
+  public:
+    ClusterNodesRequest() {
+      type(Extensions::NetworkFilters::Common::Redis::RespType::Array);
+      std::vector<NetworkFilters::Common::Redis::RespValue> values(2);
+      values[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+      values[0].asString() = "CLUSTER";
+      values[1].type(NetworkFilters::Common::Redis::RespType::BulkString);
+      values[1].asString() = "NODES";
+      asArray().swap(values);
+    }
+
+    static ClusterNodesRequest instance_;
+  };
+
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
 
   /// TimeSource& timeSource() const { return time_source_; }

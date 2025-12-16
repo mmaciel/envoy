@@ -29,6 +29,7 @@
 #include "test/mocks/upstream/cluster_priority_set.h"
 #include "test/mocks/upstream/health_check_event_logger.h"
 #include "test/mocks/upstream/health_checker.h"
+#include "test/test_common/test_runtime.h"
 
 using testing::_;
 using testing::ContainerEq;
@@ -86,6 +87,8 @@ const std::string NoWarmupConfig = R"EOF(
         cluster_refresh_timeout: 0.25s
   )EOF";
 } // namespace
+
+
 
 static const int ResponseFlagSize = 11;
 static const int ResponseReplicaFlagSize = 4;
@@ -201,6 +204,17 @@ protected:
       EXPECT_CALL(*client_, close());
     }
     EXPECT_CALL(*client_, makeRequest_(Ref(RedisCluster::ClusterSlotsRequest::instance_), _))
+        .WillOnce(Return(&pool_request_));
+  }
+
+  void expectRedisResolveClusterNodes(bool create_client = false) {
+    if (create_client) {
+      client_ = new Extensions::NetworkFilters::Common::Redis::Client::MockClient();
+      EXPECT_CALL(*this, create_(_)).WillOnce(Return(client_));
+      EXPECT_CALL(*client_, addConnectionCallbacks(_));
+      EXPECT_CALL(*client_, close());
+    }
+    EXPECT_CALL(*client_, makeRequest_(Ref(RedisCluster::ClusterNodesRequest::instance_), _))
         .WillOnce(Return(&pool_request_));
   }
 
@@ -463,6 +477,81 @@ protected:
     response->type(NetworkFilters::Common::Redis::RespType::Array);
     response->asArray().swap(slots);
     return response;
+  }
+
+  // Helper methods for CLUSTER NODES response format
+  // CLUSTER NODES returns a bulk string with lines like:
+  // <node_id> <ip:port@bus_port> <flags> <master_id> <ping> <pong> <epoch> <state> [slot...]
+  NetworkFilters::Common::Redis::RespValuePtr
+  clusterNodesResponse(const std::string& nodes_data) const {
+    NetworkFilters::Common::Redis::RespValuePtr response(
+        new NetworkFilters::Common::Redis::RespValue());
+    response->type(NetworkFilters::Common::Redis::RespType::BulkString);
+    response->asString() = nodes_data;
+    return response;
+  }
+
+  // Single master with slot range 0-16383
+  NetworkFilters::Common::Redis::RespValuePtr singleMasterClusterNodes(const std::string& ip,
+                                                                       int port) const {
+    std::string nodes_data = absl::StrFormat(
+        "node1 %s:%d@%d myself,master - 0 0 1 connected 0-16383\r\n", ip, port, port + 10000);
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Single master with a replica
+  NetworkFilters::Common::Redis::RespValuePtr
+  singleMasterWithReplicaClusterNodes(const std::string& master_ip, const std::string& replica_ip,
+                                      int port) const {
+    std::string nodes_data = absl::StrFormat(
+        "master1 %s:%d@%d myself,master - 0 0 1 connected 0-16383\r\n"
+        "replica1 %s:%d@%d slave master1 0 0 1 connected\r\n",
+        master_ip, port, port + 10000, replica_ip, port, port + 10000);
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Two masters with slot ranges 0-9999 and 10000-16383
+  NetworkFilters::Common::Redis::RespValuePtr twoMastersClusterNodes() const {
+    std::string nodes_data =
+        "master1 127.0.0.1:22120@32120 myself,master - 0 0 1 connected 0-9999\r\n"
+        "master2 127.0.0.2:22120@32120 master - 0 0 2 connected 10000-16383\r\n";
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Two masters with replicas
+  NetworkFilters::Common::Redis::RespValuePtr twoMastersWithReplicasClusterNodes() const {
+    std::string nodes_data =
+        "master1 127.0.0.1:22120@32120 myself,master - 0 0 1 connected 0-9999\r\n"
+        "replica1 127.0.0.3:22120@32120 slave master1 0 0 1 connected\r\n"
+        "master2 127.0.0.2:22120@32120 master - 0 0 2 connected 10000-16383\r\n"
+        "replica2 127.0.0.4:22120@32120 slave master2 0 0 2 connected\r\n";
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Cluster nodes with a failed master
+  NetworkFilters::Common::Redis::RespValuePtr clusterNodesWithFailedMaster() const {
+    std::string nodes_data =
+        "master1 127.0.0.1:22120@32120 myself,master,fail - 0 0 1 connected 0-9999\r\n"
+        "replica1 127.0.0.3:22120@32120 slave master1 0 0 1 connected\r\n"
+        "master2 127.0.0.2:22120@32120 master - 0 0 2 connected 10000-16383\r\n";
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Cluster nodes with replica appearing before its master
+  NetworkFilters::Common::Redis::RespValuePtr clusterNodesReplicaBeforeMaster() const {
+    std::string nodes_data =
+        "replica1 127.0.0.3:22120@32120 slave master1 0 0 1 connected\r\n"
+        "master1 127.0.0.1:22120@32120 myself,master - 0 0 1 connected 0-16383\r\n";
+    return clusterNodesResponse(nodes_data);
+  }
+
+  // Cluster nodes with hostname instead of IP
+  NetworkFilters::Common::Redis::RespValuePtr
+  clusterNodesWithHostname(const std::string& hostname, int port) const {
+    std::string nodes_data =
+        absl::StrFormat("master1 %s:%d@%d myself,master - 0 0 1 connected 0-16383\r\n", hostname,
+                        port, port + 10000);
+    return clusterNodesResponse(nodes_data);
   }
 
   NetworkFilters::Common::Redis::RespValue
@@ -1524,6 +1613,279 @@ TEST_F(RedisClusterTest, NoSegfaultOnClusterDestructionWithPendingCallback) {
   // 1. The destructor sets is_destroying_ = true
   // 2. The destructor resets redis_discovery_session_
   // 3. Timer callbacks check is_destroying_ before accessing cluster members
+}
+
+// Tests for CLUSTER NODES feature (when envoy.reloadable_features.redis_use_cluster_nodes is
+// enabled)
+class RedisClusterNodesTest : public RedisClusterTest {
+public:
+  void SetUp() override {
+    // Enable the CLUSTER NODES runtime feature
+    scoped_runtime_.mergeValues(
+        {{"envoy.reloadable_features.redis_use_cluster_nodes", "true"}});
+  }
+
+protected:
+  TestScopedRuntime scoped_runtime_;
+};
+
+// Test basic CLUSTER NODES response parsing with a single master
+TEST_F(RedisClusterNodesTest, SingleMasterClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(singleMasterClusterNodes("127.0.0.1", 22120));
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120"}));
+}
+
+// Test CLUSTER NODES response with master and replica
+TEST_F(RedisClusterNodesTest, MasterWithReplicaClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(singleMasterWithReplicaClusterNodes("127.0.0.1", "127.0.0.2", 22120));
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120", "127.0.0.2:22120"}));
+}
+
+// Test CLUSTER NODES response with two masters
+TEST_F(RedisClusterNodesTest, TwoMastersClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(twoMastersClusterNodes());
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120", "127.0.0.2:22120"}));
+}
+
+// Test CLUSTER NODES response with two masters and their replicas
+TEST_F(RedisClusterNodesTest, TwoMastersWithReplicasClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(twoMastersWithReplicasClusterNodes());
+  expectHealthyHosts(std::list<std::string>(
+      {"127.0.0.1:22120", "127.0.0.3:22120", "127.0.0.2:22120", "127.0.0.4:22120"}));
+}
+
+// Test CLUSTER NODES response where replica appears before its master in the output
+TEST_F(RedisClusterNodesTest, ReplicaBeforeMasterClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesReplicaBeforeMaster());
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120", "127.0.0.3:22120"}));
+}
+
+// Test CLUSTER NODES response with hostname requiring DNS resolution
+TEST_F(RedisClusterNodesTest, HostnameRequiresDnsResolution) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  const std::list<std::string> master_resolved{"127.0.1.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "master.redis.local", master_resolved);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesWithHostname("master.redis.local", 22120));
+  expectHealthyHosts(std::list<std::string>({"127.0.1.1:22120"}));
+}
+
+// Test CLUSTER NODES response with unexpected response type (not BulkString)
+TEST_F(RedisClusterNodesTest, UnexpectedResponseType) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  // Send an array response instead of bulk string - should be treated as error
+  NetworkFilters::Common::Redis::RespValuePtr bad_response(
+      new NetworkFilters::Common::Redis::RespValue());
+  bad_response->type(NetworkFilters::Common::Redis::RespType::Array);
+  std::vector<NetworkFilters::Common::Redis::RespValue> dummy;
+  bad_response->asArray().swap(dummy);
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _)).Times(0);
+  expectClusterSlotResponse(std::move(bad_response));
+  EXPECT_EQ(1U, cluster_->info()->configUpdateStats().update_failure_.value());
+}
+
+// Test CLUSTER NODES with malformed line (too few fields)
+TEST_F(RedisClusterNodesTest, MalformedLineSkipped) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  // Malformed line (too few fields) should be skipped, good master should be parsed
+  std::string nodes_data =
+      "malformed line with too few fields\r\n"
+      "master1 127.0.0.1:22120@32120 myself,master - 0 0 1 connected 0-16383\r\n";
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesResponse(nodes_data));
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120"}));
+}
+
+// Test CLUSTER NODES with invalid address format
+TEST_F(RedisClusterNodesTest, InvalidAddressSkipped) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  // Invalid address format should be skipped
+  std::string nodes_data =
+      "bad1 invalid_address_no_port myself,master - 0 0 1 connected 0-8191\r\n"
+      "master1 127.0.0.1:22120@32120 master - 0 0 1 connected 8192-16383\r\n";
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesResponse(nodes_data));
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120"}));
+}
+
+// Test CLUSTER NODES with failed master node
+TEST_F(RedisClusterNodesTest, FailedMasterNode) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesWithFailedMaster());
+  // Hosts include both masters plus the replica, but health states differ
+  EXPECT_EQ(3UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+}
+
+// Test CLUSTER NODES with IPv6 addresses
+TEST_F(RedisClusterNodesTest, IPv6Address) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  // IPv6 address format with port (using rfind for colon separation)
+  std::string nodes_data =
+      "master1 ::1:22120@32120 myself,master - 0 0 1 connected 0-16383\r\n";
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(clusterNodesResponse(nodes_data));
+  expectHealthyHosts(std::list<std::string>({"[::1]:22120"}));
+}
+
+// Test refresh cycle with CLUSTER NODES
+TEST_F(RedisClusterNodesTest, RefreshCycleClusterNodes) {
+  setupFromV3Yaml(BasicConfig);
+  const std::list<std::string> resolved_addresses{"127.0.0.1"};
+  expectResolveDiscovery(Network::DnsLookupFamily::V4Only, "foo.bar.com", resolved_addresses);
+  expectRedisResolveClusterNodes(true);
+
+  EXPECT_CALL(membership_updated_, ready());
+  EXPECT_CALL(initialized_, ready());
+  cluster_->initialize([&]() {
+    initialized_.ready();
+    return absl::OkStatus();
+  });
+
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(singleMasterWithReplicaClusterNodes("127.0.0.1", "127.0.0.2", 22120));
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120", "127.0.0.2:22120"}));
+
+  // Trigger refresh - should use CLUSTER NODES again
+  expectRedisResolveClusterNodes();
+  EXPECT_CALL(membership_updated_, ready());
+  resolve_timer_->invokeCallback();
+  EXPECT_CALL(*cluster_callback_, onClusterSlotUpdate(_, _));
+  expectClusterSlotResponse(twoMastersClusterNodes());
+  expectHealthyHosts(std::list<std::string>({"127.0.0.1:22120", "127.0.0.2:22120"}));
 }
 
 } // namespace Redis
