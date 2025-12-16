@@ -33,8 +33,7 @@ public:
       : start_(start), end_(end), primary_(std::move(primary)) {}
 
   int64_t start() const { return start_; }
-  int64_t end() const { return end_; }
-  std::string slotState() const { return slot_state_; }
+  int64_t end() const { return end_; }  
   Network::Address::InstanceConstSharedPtr primary() const { return primary_; }
   const absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr>& replicas() const {
     return replicas_;
@@ -49,8 +48,7 @@ public:
   void addReplicaToResolve(const std::string& host, uint16_t port) {
     replicas_to_resolve_.emplace_back(host, port);
   }
-  void setSlotState(const std::string& slot_state) { slot_state_ = slot_state; }
-
+  
   bool operator==(const ClusterSlot& rhs) const;
 
   // In case of primary slot address is hostname and needs to be resolved
@@ -61,7 +59,6 @@ public:
 private:
   int64_t start_;
   int64_t end_;
-  std::string slot_state_;
   Network::Address::InstanceConstSharedPtr primary_;
   absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr> replicas_;
 };
