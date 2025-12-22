@@ -173,6 +173,9 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
     } else {
       return {nullptr};
     }
+  } else {
+    shard = shard_vector_->at(
+        slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
   }
 
   auto redis_context = dynamic_cast<RedisLoadBalancerContext*>(context);
