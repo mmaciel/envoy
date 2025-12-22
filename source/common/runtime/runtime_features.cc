@@ -203,6 +203,8 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_reject_early_connect_data);
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_http2_use_oghttp2);
 // TODO(mmaciel) Flip to true once testing is complete in proper production environment.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_redis_use_cluster_nodes);
+// TODO(mmaciel) Flip to true once testing is complete in proper production environment.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_redis_cluster_skip_failed_slots);
 
 // Block of non-boolean flags. Use of int flags is deprecated. Do not add more.
 ABSL_FLAG(uint64_t, re2_max_program_size_error_level, 100, ""); // NOLINT

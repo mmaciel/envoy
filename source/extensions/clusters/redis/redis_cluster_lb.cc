@@ -168,23 +168,12 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
   RedisShardSharedPtr shard;
 
   if (dynamic_cast<const RedisSpecifyShardContextImpl*>(context)) {
-    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_unhealthy_slots")) {
-      const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
-    
-      // Check if slot is unhealthy
-      if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
-        return {nullptr};
-      }
-      
-      shard = shard_vector_->at(slot_array_->at(slot_number));
+    if (hash.value() < shard_vector_->size()) {
+      shard = shard_vector_->at(hash.value());
     } else {
-      if (hash.value() < shard_vector_->size()) {
-        shard = shard_vector_->at(hash.value());
-      } else {
-        return {nullptr};
-      }
+      return {nullptr};
     }
-  } 
+  }
 
   auto redis_context = dynamic_cast<RedisLoadBalancerContext*>(context);
   if (redis_context && redis_context->isReadCommand()) {
@@ -193,6 +182,15 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
       return shard->primary();
     case NetworkFilters::Common::Redis::Client::ReadPolicy::PreferPrimary:
       if (shard->primary()->coarseHealth() == Upstream::Host::Health::Healthy) {
+        if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_failed_slots")) {
+          const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
+        
+          // Read might still happen normally when picked randomly.
+          if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
+            return chooseRandomHost(shard->allHosts(), random_);
+          }
+        }
+        
         return shard->primary();
       } else {
         return chooseRandomHost(shard->allHosts(), random_);
@@ -210,10 +208,13 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
     }
   }
 
-  // Fail in case the shard is in fail state. We can read from replicas but writing would fail otherwise.
-  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_use_cluster_nodes") && 
-        shard->primary()->coarseHealth() == Upstream::Host::Health::Unhealthy) {
-    return {nullptr};
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_failed_slots")) {
+    const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
+  
+    // Write should fail, we cannot even try.
+    if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
+      return {nullptr};
+    }
   }
 
   return shard->primary();
