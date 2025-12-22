@@ -31,7 +31,7 @@ using ReplicaToResolve = std::pair<std::string, uint16_t>;
 class ClusterSlot {
 public:
   ClusterSlot(int64_t start, int64_t end, Network::Address::InstanceConstSharedPtr primary)
-      : start_(start), end_(end), is_healthy_(true), primary_(std::move(primary)) {}
+      : start_(start), end_(end), primary_(std::move(primary)) {}
 
   int64_t start() const { return start_; }
   int64_t end() const { return end_; }
@@ -64,7 +64,7 @@ public:
 private:
   int64_t start_;
   int64_t end_;
-  bool is_healthy_;
+  bool is_healthy_{};
   Network::Address::InstanceConstSharedPtr primary_;
   absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr> replicas_;
 };
