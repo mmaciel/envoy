@@ -35,10 +35,17 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsSharedPtr&
   auto updated_slots = std::make_shared<SlotArray>();
   auto shard_vector = std::make_shared<std::vector<RedisShardSharedPtr>>();
   absl::flat_hash_map<std::string, uint64_t> shards;
+  auto unhealthy_slots = std::make_shared<UnhealthySlotSet>();
 
   for (const ClusterSlot& slot : *slots) {
     // look in the updated map
     const std::string primary_address = slot.primary()->asString();
+
+    if (!slot.isHealthy()) {
+      for (auto i = slot.start(); i <= slot.end(); ++i) {
+        unhealthy_slots->set(i);
+      }
+    }
 
     auto result = shards.try_emplace(primary_address, shard_vector->size());
     if (result.second) {
@@ -66,17 +73,7 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsSharedPtr&
       updated_slots->at(i) = result.first->second;
     }
   }
-
-  // Build unhealthy slots bitset
-  auto unhealthy_slots = std::make_shared<UnhealthySlotSet>();
-  for (const ClusterSlot& slot : *slots) {
-    if (!slot.isHealthy()) {
-      for (auto i = slot.start(); i <= slot.end(); ++i) {
-        unhealthy_slots->set(i);
-      }
-    }
-  }
-
+  
   {
     absl::WriterMutexLock lock(mutex_);
     current_cluster_slot_ = std::move(slots);
