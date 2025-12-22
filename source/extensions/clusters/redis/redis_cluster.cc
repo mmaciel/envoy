@@ -10,7 +10,6 @@
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.validate.h"
 
 #include "absl/strings/numbers.h"
-#include "absl/strings/str_contains.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -618,9 +617,7 @@ void RedisCluster::RedisDiscoverySession::onResponse(
         healthy_node = false;
       }
 
-      if (absl::StrContains(flags, "master")) {        
-        absl::string_view last_flag = flags;
-
+      if (absl::StrContains(flags, "master")) {
         for (size_t i = 8; i < fields.size(); ++i) {
           absl::string_view slot_field = fields[i];
 
@@ -645,9 +642,7 @@ void RedisCluster::RedisDiscoverySession::onResponse(
 
           auto primary_address = Network::Utility::parseInternetAddressNoThrow(host, port, false);
           ClusterSlot slot(start, end, primary_address);
-
-          // Setting health to unhealthy to prevent further calls into this primary.
-          slot->primary()->coarseHealth(healthy_node ? Upstream::Host::Health::Healthy : Upstream::Host::Health::Unhealthy);
+          slot.setHealth(healthy_node);
 
           if (slot.primary() == nullptr) {
             // Address is potentially a hostname, save it for async DNS resolution

@@ -67,20 +67,33 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsSharedPtr&
     }
   }
 
+  // Build unhealthy slots bitset
+  auto unhealthy_slots = std::make_shared<UnhealthySlotSet>();
+  for (const ClusterSlot& slot : *slots) {
+    if (!slot.isHealthy()) {
+      for (auto i = slot.start(); i <= slot.end(); ++i) {
+        unhealthy_slots->set(i);
+      }
+    }
+  }
+
   {
     absl::WriterMutexLock lock(mutex_);
     current_cluster_slot_ = std::move(slots);
     slot_array_ = std::move(updated_slots);
     shard_vector_ = std::move(shard_vector);
+    unhealthy_slots_ = std::move(unhealthy_slots);
   }
   return true;
 }
 
 void RedisClusterLoadBalancerFactory::onHostHealthUpdate() {
   ShardVectorSharedPtr current_shard_vector;
+  ClusterSlotsSharedPtr current_cluster_slot;
   {
     absl::ReaderMutexLock lock(mutex_);
     current_shard_vector = shard_vector_;
+    current_cluster_slot = current_cluster_slot_;
   }
 
   // This can get called by cluster initialization before the Redis Cluster topology is resolved.
@@ -95,15 +108,29 @@ void RedisClusterLoadBalancerFactory::onHostHealthUpdate() {
         shard->primary(), shard->replicas().hostsPtr(), shard->allHosts().hostsPtr(), random_));
   }
 
+  // Rebuild unhealthy slots bitset based on current cluster slot health
+  auto unhealthy_slots = std::make_shared<UnhealthySlotSet>();
+  if (current_cluster_slot) {
+    for (const ClusterSlot& slot : *current_cluster_slot) {
+      if (!slot.isHealthy()) {
+        for (auto i = slot.start(); i <= slot.end(); ++i) {
+          unhealthy_slots->set(i);
+        }
+      }
+    }
+  }
+
   {
     absl::WriterMutexLock lock(mutex_);
     shard_vector_ = std::move(shard_vector);
+    unhealthy_slots_ = std::move(unhealthy_slots);
   }
 }
 
 Upstream::LoadBalancerPtr RedisClusterLoadBalancerFactory::create(Upstream::LoadBalancerParams) {
   absl::ReaderMutexLock lock(mutex_);
-  return std::make_unique<RedisClusterLoadBalancer>(slot_array_, shard_vector_, random_);
+  return std::make_unique<RedisClusterLoadBalancer>(slot_array_, shard_vector_, unhealthy_slots_,
+                                                     random_);
 }
 
 namespace {
@@ -144,14 +171,23 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
   RedisShardSharedPtr shard;
 
   if (dynamic_cast<const RedisSpecifyShardContextImpl*>(context)) {
-    if (hash.value() < shard_vector_->size()) {
-      shard = shard_vector_->at(hash.value());
+    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_unhealthy_slots")) {
+      const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
+    
+      // Check if slot is unhealthy
+      if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
+        return {nullptr};
+      }
+      
+      shard = shard_vector_->at(slot_array_->at(slot_number));
     } else {
-      return {nullptr};
+      if (hash.value() < shard_vector_->size()) {
+        shard = shard_vector_->at(hash.value());
+      } else {
+        return {nullptr};
+      }
     }
-  } else {
-    shard = shard_vector_->at(slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
-  }
+  } 
 
   auto redis_context = dynamic_cast<RedisLoadBalancerContext*>(context);
   if (redis_context && redis_context->isReadCommand()) {

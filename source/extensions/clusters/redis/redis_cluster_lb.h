@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,8 @@ public:
       : start_(start), end_(end), primary_(std::move(primary)) {}
 
   int64_t start() const { return start_; }
-  int64_t end() const { return end_; }  
+  int64_t end() const { return end_; }
+  bool isHealthy() const { return is_healthy_; }
   Network::Address::InstanceConstSharedPtr primary() const { return primary_; }
   const absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr>& replicas() const {
     return replicas_;
@@ -48,6 +50,9 @@ public:
   void addReplicaToResolve(const std::string& host, uint16_t port) {
     replicas_to_resolve_.emplace_back(host, port);
   }
+  void setHealth(bool health) {
+    is_healthy_ = health;
+  }
   
   bool operator==(const ClusterSlot& rhs) const;
 
@@ -59,6 +64,7 @@ public:
 private:
   int64_t start_;
   int64_t end_;
+  bool is_healthy_;
   Network::Address::InstanceConstSharedPtr primary_;
   absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr> replicas_;
 };
@@ -198,6 +204,8 @@ private:
   using ShardVectorSharedPtr = std::shared_ptr<std::vector<RedisShardSharedPtr>>;
   using SlotArray = std::array<uint64_t, MaxSlot>;
   using SlotArraySharedPtr = std::shared_ptr<const SlotArray>;
+  using UnhealthySlotSet = std::bitset<MaxSlot>;
+  using UnhealthySlotSetSharedPtr = std::shared_ptr<const UnhealthySlotSet>;
 
   /*
    * This class implements load balancing according to `Redis Cluster
@@ -214,9 +222,10 @@ private:
   class RedisClusterLoadBalancer : public Upstream::LoadBalancer {
   public:
     RedisClusterLoadBalancer(SlotArraySharedPtr slot_array, ShardVectorSharedPtr shard_vector,
+                             UnhealthySlotSetSharedPtr unhealthy_slots,
                              Random::RandomGenerator& random)
         : slot_array_(std::move(slot_array)), shard_vector_(std::move(shard_vector)),
-          random_(random) {}
+          unhealthy_slots_(std::move(unhealthy_slots)), random_(random) {}
 
     // Upstream::LoadBalancerBase
     Upstream::HostSelectionResponse chooseHost(Upstream::LoadBalancerContext*) override;
@@ -238,11 +247,13 @@ private:
   private:
     const SlotArraySharedPtr slot_array_;
     const ShardVectorSharedPtr shard_vector_;
+    const UnhealthySlotSetSharedPtr unhealthy_slots_;
     Random::RandomGenerator& random_;
   };
 
   absl::Mutex mutex_;
   SlotArraySharedPtr slot_array_ ABSL_GUARDED_BY(mutex_);
+  UnhealthySlotSetSharedPtr unhealthy_slots_ ABSL_GUARDED_BY(mutex_);
   ClusterSlotsSharedPtr current_cluster_slot_;
   ShardVectorSharedPtr shard_vector_;
   Random::RandomGenerator& random_;
