@@ -531,7 +531,7 @@ void RedisCluster::RedisDiscoverySession::onResponse(
     // e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:30001@31001,hostname1 myself,master - 0 0 1 connected 0-5460
     //
     // CLUSTER NODES returns a bulk string containing text lines
-    if (value->type() != NetworkFilters::Common::Redis::RespType::BulkString) {
+    if (value->type() != NetworkFilters::Common::Redis::RespType::Array) {
       onUnexpectedResponse(value);
       return;
     }
@@ -612,7 +612,7 @@ void RedisCluster::RedisDiscoverySession::onResponse(
       }
 
       if (last_flag == "fail" || last_flag == "handshake" || last_flag == "noaddr") {
-        ENVOY_LOG(warn, "redis cluster nodes: skipping master node {} with flags: {}", node_id,
+        ENVOY_LOG(warn, "redis cluster nodes: marking node {} with flags: {} as unhealthy", node_id,
                   flags);
         healthy_node = false;
       }

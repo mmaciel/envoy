@@ -415,6 +415,58 @@ public:
       : RedisClusterIntegrationTest(config, num_upstreams) {}
 };
 
+// Integration test class that enables the redis_use_cluster_nodes runtime flag so that Envoy
+// uses CLUSTER NODES (instead of CLUSTER SLOTS) for topology discovery.
+class RedisClusterNodesIntegrationTest : public RedisClusterIntegrationTest {
+public:
+  RedisClusterNodesIntegrationTest() : RedisClusterIntegrationTest(testConfig(), 2) {}
+
+  void initialize() override {
+    config_helper_.addRuntimeOverride("envoy.reloadable_features.redis_use_cluster_nodes", "true");
+    RedisClusterIntegrationTest::initialize();
+  }
+
+protected:
+  // Build a CLUSTER NODES bulk-string response with one master covering all 16384 slots and one
+  // replica. The @bus_port convention (port + 10000) is the standard Redis cluster default.
+  std::string singleSlotClusterNodes(const Network::Address::Ip* primary,
+                                     const Network::Address::Ip* replica) {
+    std::string data =
+        fmt::format("master1 {}:{}@{} myself,master - 0 0 1 connected 0-16383\r\n"
+                    "replica1 {}:{}@{} slave master1 0 0 1 connected\r\n",
+                    primary->addressAsString(), primary->port(), primary->port() + 10000,
+                    replica->addressAsString(), replica->port(), replica->port() + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Build a CLUSTER NODES bulk-string response with two masters split across the slot space.
+  // master1 owns slots 0–9999; master2 owns slots 10000–16383 (matching twoSlots() split).
+  std::string twoSlotClusterNodes(const Network::Address::Ip* slot1,
+                                  const Network::Address::Ip* slot2) {
+    std::string data =
+        fmt::format("master1 {}:{}@{} myself,master - 0 0 1 connected 0-9999\r\n"
+                    "master2 {}:{}@{} master - 0 0 2 connected 10000-16383\r\n",
+                    slot1->addressAsString(), slot1->port(), slot1->port() + 10000,
+                    slot2->addressAsString(), slot2->port(), slot2->port() + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Expect the proxy to open a topology-discovery connection to the given upstream, send a
+  // CLUSTER NODES command, and respond with the provided bulk-string payload.
+  void expectCallClusterNodes(int stream_index, std::string& response) {
+    std::string cluster_nodes_request = makeBulkStringArray({"CLUSTER", "NODES"});
+    std::string proxied_request;
+
+    FakeRawConnectionPtr fake_upstream_connection;
+    EXPECT_TRUE(fake_upstreams_[stream_index]->waitForRawConnection(fake_upstream_connection));
+    EXPECT_TRUE(fake_upstream_connection->waitForData(cluster_nodes_request.size(),
+                                                      &proxied_request));
+    EXPECT_EQ(cluster_nodes_request, proxied_request);
+    EXPECT_TRUE(fake_upstream_connection->write(response));
+    EXPECT_TRUE(fake_upstream_connection->close());
+  }
+};
+
 INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
@@ -428,6 +480,10 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterWithReadPolicyIntegrationTest,
                          TestUtility::ipTestParamsToString);
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterWithRefreshIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterNodesIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
 
@@ -722,6 +778,111 @@ TEST_P(RedisAdsIntegrationTest, RedisClusterRemoval) {
 
 INSTANTIATE_TEST_SUITE_P(IpVersionsClientTypeDeltaWildcard, RedisAdsIntegrationTest,
                          ADS_INTEGRATION_PARAMS);
+
+// ---- CLUSTER NODES integration tests --------------------------------------------------
+//
+// The following tests verify end-to-end behaviour when
+// envoy.reloadable_features.redis_use_cluster_nodes is enabled.  Each test asserts that
+// Envoy sends "CLUSTER NODES" (not "CLUSTER SLOTS") for topology discovery and that key
+// routing based on the returned topology is correct.
+
+// Basic single-shard topology via CLUSTER NODES.  Verifies that:
+//  * the proxy issues a CLUSTER NODES command during startup, and
+//  * a key that hashes into the single shard is forwarded to the primary upstream.
+TEST_P(RedisClusterNodesIntegrationTest, SingleSlotPrimaryReplica) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                                  fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // "foo" hashes to slot 12182, owned by upstream 0 (the master for all slots).
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// Two-shard topology via CLUSTER NODES.  Verifies that keys are routed to the correct
+// upstream based on slot ownership reported in the CLUSTER NODES response.
+TEST_P(RedisClusterNodesIntegrationTest, TwoSlots) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = twoSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                               fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // "foobar" -> slot 12325, in master2 range 10000-16383 -> upstream 1.
+  simpleRequestAndResponse(1, makeBulkStringArray({"get", "foobar"}), "$3\r\nbar\r\n");
+  // "bar"    -> slot 5061,  in master1 range 0-9999       -> upstream 0.
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "bar"}), "$3\r\nbar\r\n");
+  // "foo"    -> slot 12182, in master2 range 10000-16383  -> upstream 1.
+  simpleRequestAndResponse(1, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// After a MOVED redirection the proxy triggers topology re-discovery.  When
+// redis_use_cluster_nodes is enabled the re-discovery connection must send CLUSTER NODES,
+// not CLUSTER SLOTS.
+TEST_P(RedisClusterNodesIntegrationTest, ClusterNodesRequestAfterRedirection) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                                  fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  std::string request = makeBulkStringArray({"get", "foo"});
+  std::string redirection_response =
+      "-MOVED 12182 " + redisAddressAndPortNoThrow(fake_upstreams_[1]) + "\r\n";
+  std::string response = "$3\r\nbar\r\n";
+  std::string cluster_nodes_request = makeBulkStringArray({"CLUSTER", "NODES"});
+  std::string proxy_to_server;
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  ASSERT_TRUE(redis_client->write(request));
+
+  FakeRawConnectionPtr fake_upstream_connection_1, fake_upstream_connection_2,
+      fake_upstream_connection_3;
+
+  // Initial request is routed to upstream 0.
+  EXPECT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_1));
+  EXPECT_TRUE(fake_upstream_connection_1->waitForData(request.size(), &proxy_to_server));
+  EXPECT_EQ(request, proxy_to_server);
+  proxy_to_server.clear();
+
+  // Upstream 0 responds with a MOVED redirection pointing to upstream 1.
+  EXPECT_TRUE(fake_upstream_connection_1->write(redirection_response));
+
+  // The proxy follows the redirect and forwards the original request to upstream 1.
+  EXPECT_TRUE(fake_upstreams_[1]->waitForRawConnection(fake_upstream_connection_2));
+  EXPECT_TRUE(fake_upstream_connection_2->waitForData(request.size(), &proxy_to_server));
+  EXPECT_EQ(request, proxy_to_server);
+
+  EXPECT_TRUE(fake_upstream_connection_2->write(response));
+  redis_client->waitForData(response);
+  EXPECT_EQ(response, redis_client->data());
+
+  // The proxy opens a fresh connection to upstream 0 to refresh topology.
+  // With redis_use_cluster_nodes enabled it must send CLUSTER NODES, not CLUSTER SLOTS.
+  proxy_to_server.clear();
+  EXPECT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_3));
+  EXPECT_TRUE(
+      fake_upstream_connection_3->waitForData(cluster_nodes_request.size(), &proxy_to_server));
+  EXPECT_EQ(cluster_nodes_request, proxy_to_server);
+
+  EXPECT_TRUE(fake_upstream_connection_1->close());
+  EXPECT_TRUE(fake_upstream_connection_2->close());
+  EXPECT_TRUE(fake_upstream_connection_3->close());
+  redis_client->close();
+}
 
 } // namespace
 } // namespace Envoy

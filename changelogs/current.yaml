@@ -282,6 +282,18 @@ removed_config_or_runtime:
     and legacy code path.
 
 new_features:
+- area: redis
+  change: |
+    Added support for ``CLUSTER NODES`` topology discovery as an alternative to ``CLUSTER SLOTS``
+    for Redis Cluster. When enabled, Envoy uses the ``CLUSTER NODES`` command to discover the
+    cluster topology, which is more widely supported and includes additional node state information.
+    Controlled by runtime flag ``envoy.reloadable_features.redis_use_cluster_nodes`` (default: false).
+- area: redis
+  change: |
+    Added failed-slot tracking for the Redis cluster load balancer. When enabled, the load balancer
+    maintains a bitmap of slots that have failed health checks and skips routing requests to those
+    unhealthy slots. Controlled by runtime flag
+    ``envoy.reloadable_features.redis_cluster_skip_failed_slots`` (default: false).
 - area: dynamic_modules
   change: |
     Added upstream HTTP TCP bridge extension for dynamic modules. This enables modules to transform

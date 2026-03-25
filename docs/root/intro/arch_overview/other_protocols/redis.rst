@@ -74,15 +74,46 @@ The Envoy proxy will keep track of the cluster topology and send commands to the
 cluster according to the `spec <https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/>`_. Advance features such as reading
 from replicas can also be added to the Envoy proxy instead of updating redis clients in each language.
 
-Envoy proxy tracks the topology of the cluster by sending periodic
-`cluster slots <https://redis.io/commands/cluster-slots>`_ commands to a random node in the cluster, and maintains the
-following information:
+Envoy proxy tracks the topology of the cluster by periodically querying a random node and maintains
+the following information:
 
 * List of known nodes.
 * The primaries for each shard.
 * Nodes entering or leaving the cluster.
 
-Envoy proxy supports identification of the nodes via both IP address and hostnames in the ``cluster slots`` command response. In case of failure to resolve a primary hostname, Envoy will retry resolution of all nodes periodically until success. Failure to resolve a replica simply skips that replica. On the other hand, if the :ref:`enable_redirection <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>` option is set and a MOVED or ASK response containing a hostname is received Envoy will not automatically do a DNS lookup and instead bubble the error to the client verbatim. To have Envoy do the DNS lookup and follow the redirection, you need to configure the DNS cache option :ref:`dns_cache_config <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.dns_cache_config>` under the connection pool settings. For a configuration example on how to enable DNS lookups for redirections, see the filter :ref:`configuration reference <config_network_filters_redis_proxy>`.
+.. _arch_overview_redis_topology_discovery:
+
+Topology Discovery Methods
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Envoy supports two commands for topology discovery, selectable via a runtime flag:
+
+**CLUSTER SLOTS** (default)
+  Envoy sends periodic `CLUSTER SLOTS <https://redis.io/commands/cluster-slots>`_ commands to a
+  random node in the cluster. This is the default behavior.
+
+**CLUSTER NODES** (opt-in)
+  Envoy sends periodic `CLUSTER NODES <https://redis.io/commands/cluster-nodes>`_ commands instead.
+  ``CLUSTER NODES`` is more widely supported across Redis-compatible deployments and provides
+  additional node state information such as link state and flags. Enable this mode by setting the
+  runtime flag ``envoy.reloadable_features.redis_use_cluster_nodes`` to ``true``.
+
+Envoy proxy supports identification of the nodes via both IP address and hostnames in the topology
+command response. In case of failure to resolve a primary hostname, Envoy will retry resolution of
+all nodes periodically until success. Failure to resolve a replica simply skips that replica. On the
+other hand, if the :ref:`enable_redirection <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>` option is set and a MOVED or ASK response containing a hostname is received Envoy will not automatically do a DNS lookup and instead bubble the error to the client verbatim. To have Envoy do the DNS lookup and follow the redirection, you need to configure the DNS cache option :ref:`dns_cache_config <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.dns_cache_config>` under the connection pool settings. For a configuration example on how to enable DNS lookups for redirections, see the filter :ref:`configuration reference <config_network_filters_redis_proxy>`.
+
+.. _arch_overview_redis_failed_slots:
+
+Failed Slot Routing
+~~~~~~~~~~~~~~~~~~~
+
+When the runtime flag ``envoy.reloadable_features.redis_cluster_skip_failed_slots`` is set to
+``true``, the Redis cluster load balancer maintains a bitmap of slots whose primary nodes have been
+marked as unhealthy (e.g., via active health checking or outlier detection). Requests targeting
+those slots are skipped and an error is returned to the client immediately, avoiding routing to a
+known-bad shard. This flag is ``false`` by default; without it, requests are routed to the
+designated primary regardless of its health state.
 
 For topology configuration details, see the Redis Cluster
 :ref:`v3 API reference <envoy_v3_api_msg_extensions.clusters.redis.v3.RedisClusterConfig>`.
