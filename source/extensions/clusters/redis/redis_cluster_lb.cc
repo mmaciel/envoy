@@ -188,9 +188,12 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
         if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_failed_slots")) {
           const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
         
-          // Read might still happen normally when picked randomly.
-          if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
-            return chooseRandomHost(shard->allHosts(), random_);
+          // Read might still happen normally when a replica picked randomly.
+          if (unhealthy_slots_ && unhealthy_slots_->test(slot_number) && !shard->replicas().healthyHosts().empty()) {
+            return chooseRandomHost(shard->replicas(), random_);
+          } else {
+            // At this time, there's nowhere to go.
+            return {nullptr};
           }
         }
         
@@ -214,7 +217,7 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.redis_cluster_skip_failed_slots")) {
     const uint64_t slot_number = hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot;
   
-    // Write should fail, we cannot even try.
+    // Write would just fail, we cannot even try.
     if (unhealthy_slots_ && unhealthy_slots_->test(slot_number)) {
       return {nullptr};
     }

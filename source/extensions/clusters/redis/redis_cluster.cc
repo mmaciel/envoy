@@ -531,7 +531,7 @@ void RedisCluster::RedisDiscoverySession::onResponse(
     // e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:30001@31001,hostname1 myself,master - 0 0 1 connected 0-5460
     //
     // CLUSTER NODES returns a bulk string containing text lines
-    if (value->type() != NetworkFilters::Common::Redis::RespType::Array) {
+    if (value->type() != NetworkFilters::Common::Redis::RespType::BulkString) {
       onUnexpectedResponse(value);
       return;
     }

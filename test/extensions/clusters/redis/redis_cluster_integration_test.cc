@@ -419,7 +419,9 @@ public:
 // uses CLUSTER NODES (instead of CLUSTER SLOTS) for topology discovery.
 class RedisClusterNodesIntegrationTest : public RedisClusterIntegrationTest {
 public:
-  RedisClusterNodesIntegrationTest() : RedisClusterIntegrationTest(testConfig(), 2) {}
+  RedisClusterNodesIntegrationTest(const std::string& config = testConfig(),
+                                   int num_upstreams = 2)
+      : RedisClusterIntegrationTest(config, num_upstreams) {}
 
   void initialize() override {
     config_helper_.addRuntimeOverride("envoy.reloadable_features.redis_use_cluster_nodes", "true");
@@ -440,7 +442,7 @@ protected:
   }
 
   // Build a CLUSTER NODES bulk-string response with two masters split across the slot space.
-  // master1 owns slots 0–9999; master2 owns slots 10000–16383 (matching twoSlots() split).
+  // master1 owns slots 0-9999; master2 owns slots 10000-16383.
   std::string twoSlotClusterNodes(const Network::Address::Ip* slot1,
                                   const Network::Address::Ip* slot2) {
     std::string data =
@@ -451,20 +453,103 @@ protected:
     return fmt::format("${}\r\n{}\r\n", data.size(), data);
   }
 
-  // Expect the proxy to open a topology-discovery connection to the given upstream, send a
-  // CLUSTER NODES command, and respond with the provided bulk-string payload.
-  void expectCallClusterNodes(int stream_index, std::string& response) {
+  // Build a CLUSTER NODES bulk-string response using hostnames instead of IP addresses,
+  // mirroring singleSlotPrimaryReplicaHostnames() for the CLUSTER SLOTS path.
+  std::string singleSlotClusterNodesHostnames(const std::string& primary_hostname,
+                                              uint32_t primary_port,
+                                              const std::string& replica_hostname,
+                                              uint32_t replica_port) {
+    std::string data =
+        fmt::format("master1 {}:{}@{} myself,master - 0 0 1 connected 0-16383\r\n"
+                    "replica1 {}:{}@{} slave master1 0 0 1 connected\r\n",
+                    primary_hostname, primary_port, primary_port + 10000,
+                    replica_hostname, replica_port, replica_port + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Build a CLUSTER NODES response containing one line with only 4 space-separated fields
+  // (below the required 8), which the parser must skip, followed by a valid master line.
+  // Used to verify parser resilience: the bad line is dropped, good topology is still built.
+  std::string clusterNodesWithMalformedLine(const Network::Address::Ip* primary) {
+    std::string data =
+        fmt::format("too few fields only\r\n"
+                    "master1 {}:{}@{} myself,master - 0 0 1 connected 0-16383\r\n",
+                    primary->addressAsString(), primary->port(), primary->port() + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Build a CLUSTER NODES response where one line has an address field with no colon
+  // (parseNodeAddress returns false), followed by a valid master line.
+  // Used to verify that the bad-address line is skipped without discarding the whole response.
+  std::string clusterNodesWithInvalidAddress(const Network::Address::Ip* primary) {
+    std::string data =
+        fmt::format("node_bad no_colon_address master - 0 0 1 connected 0-1000\r\n"
+                    "master1 {}:{}@{} myself,master - 0 0 1 connected 0-16383\r\n",
+                    primary->addressAsString(), primary->port(), primary->port() + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Build a CLUSTER NODES response where the master's first slot field is an unparseable
+  // range ("not-a-range"), which the inner slot loop must skip via continue, while the
+  // following valid "0-16383" field is still processed.
+  std::string clusterNodesWithInvalidSlotRange(const Network::Address::Ip* primary) {
+    std::string data =
+        fmt::format("master1 {}:{}@{} myself,master - 0 0 1 connected not-a-range 0-16383\r\n",
+                    primary->addressAsString(), primary->port(), primary->port() + 10000);
+    return fmt::format("${}\r\n{}\r\n", data.size(), data);
+  }
+
+  // Expect the proxy to open a topology-discovery connection to the given upstream, optionally
+  // handle an AUTH exchange, send CLUSTER NODES, and reply with the provided bulk-string payload.
+  void expectCallClusterNodes(int stream_index, const std::string& response,
+                              const std::string& auth_username = "",
+                              const std::string& auth_password = "") {
     std::string cluster_nodes_request = makeBulkStringArray({"CLUSTER", "NODES"});
     std::string proxied_request;
+    std::string ok = "+OK\r\n";
 
     FakeRawConnectionPtr fake_upstream_connection;
     EXPECT_TRUE(fake_upstreams_[stream_index]->waitForRawConnection(fake_upstream_connection));
-    EXPECT_TRUE(fake_upstream_connection->waitForData(cluster_nodes_request.size(),
-                                                      &proxied_request));
-    EXPECT_EQ(cluster_nodes_request, proxied_request);
+
+    if (auth_password.empty()) {
+      EXPECT_TRUE(fake_upstream_connection->waitForData(cluster_nodes_request.size(),
+                                                        &proxied_request));
+      EXPECT_EQ(cluster_nodes_request, proxied_request);
+    } else if (auth_username.empty()) {
+      std::string auth_request = makeBulkStringArray({"auth", auth_password});
+      EXPECT_TRUE(fake_upstream_connection->waitForData(
+          auth_request.size() + cluster_nodes_request.size(), &proxied_request));
+      EXPECT_EQ(auth_request + cluster_nodes_request, proxied_request);
+      EXPECT_TRUE(fake_upstream_connection->write(ok));
+    } else {
+      std::string auth_request = makeBulkStringArray({"auth", auth_username, auth_password});
+      EXPECT_TRUE(fake_upstream_connection->waitForData(
+          auth_request.size() + cluster_nodes_request.size(), &proxied_request));
+      EXPECT_EQ(auth_request + cluster_nodes_request, proxied_request);
+      EXPECT_TRUE(fake_upstream_connection->write(ok));
+    }
+
     EXPECT_TRUE(fake_upstream_connection->write(response));
     EXPECT_TRUE(fake_upstream_connection->close());
   }
+};
+
+class RedisClusterNodesWithAuthIntegrationTest : public RedisClusterNodesIntegrationTest {
+public:
+  RedisClusterNodesWithAuthIntegrationTest()
+      : RedisClusterNodesIntegrationTest(testConfigWithAuth(), 2) {}
+};
+
+class RedisClusterNodesWithReadPolicyIntegrationTest : public RedisClusterNodesIntegrationTest {
+public:
+  RedisClusterNodesWithReadPolicyIntegrationTest()
+      : RedisClusterNodesIntegrationTest(testConfigWithReadPolicy(), 3) {}
+};
+
+class RedisClusterNodesWithRefreshIntegrationTest : public RedisClusterNodesIntegrationTest {
+public:
+  RedisClusterNodesWithRefreshIntegrationTest()
+      : RedisClusterNodesIntegrationTest(testConfigWithRefresh(), 3) {}
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterIntegrationTest,
@@ -484,6 +569,18 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterWithRefreshIntegrationTest,
                          TestUtility::ipTestParamsToString);
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterNodesIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterNodesWithAuthIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterNodesWithReadPolicyIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, RedisClusterNodesWithRefreshIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
 
@@ -881,6 +978,166 @@ TEST_P(RedisClusterNodesIntegrationTest, ClusterNodesRequestAfterRedirection) {
   EXPECT_TRUE(fake_upstream_connection_1->close());
   EXPECT_TRUE(fake_upstream_connection_2->close());
   EXPECT_TRUE(fake_upstream_connection_3->close());
+  redis_client->close();
+}
+
+// ---- Additional CLUSTER NODES tests covering gaps identified in review ----------------
+
+// V5: Topology discovered via CLUSTER NODES with hostname-addressed nodes.  Mirrors the
+// SingleSlotPrimaryReplicaHostnames test for CLUSTER SLOTS.
+TEST_P(RedisClusterNodesIntegrationTest, SingleSlotPrimaryReplicaHostnames) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodesHostnames(
+        "localhost", fake_upstreams_[0]->localAddress()->ip()->port(), "localhost",
+        fake_upstreams_[1]->localAddress()->ip()->port());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // "foo" hashes to slot 12182, owned by the master (upstream 0).
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// C1: A CLUSTER NODES response line with fewer than 8 fields must be skipped by the parser
+// while the remaining valid lines are still processed and the topology built correctly.
+TEST_P(RedisClusterNodesIntegrationTest, MalformedLineSkipped) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = clusterNodesWithMalformedLine(fake_upstreams_[0]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // The malformed line was dropped; the valid master covers all slots, so routing succeeds.
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// C1: A CLUSTER NODES response line whose address field cannot be parsed (no colon separator)
+// must be skipped by the parser while subsequent valid lines are still processed.
+TEST_P(RedisClusterNodesIntegrationTest, InvalidAddressLineSkipped) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response =
+        clusterNodesWithInvalidAddress(fake_upstreams_[0]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // The bad-address line was dropped; the valid master covers all slots, so routing succeeds.
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// C1: When a slot field in a CLUSTER NODES master line is an unparseable range, the inner
+// slot loop must skip that field via continue and still process the following valid range.
+TEST_P(RedisClusterNodesIntegrationTest, InvalidSlotRangeSkipped) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response =
+        clusterNodesWithInvalidSlotRange(fake_upstreams_[0]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // The "not-a-range" slot field was skipped; the valid "0-16383" field was processed, so
+  // the master owns all slots and routing succeeds.
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+}
+
+// V1: CLUSTER NODES topology discovery with upstream authentication.  Verifies that the proxy
+// issues AUTH before CLUSTER NODES on the discovery connection, and that subsequent client
+// requests also authenticate correctly.
+TEST_P(RedisClusterNodesWithAuthIntegrationTest, SingleSlotPrimaryReplica) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                                  fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(0, response, "", "somepassword");
+  };
+
+  initialize();
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  FakeRawConnectionPtr fake_upstream_connection;
+
+  roundtripToUpstreamStep(fake_upstreams_[random_index_], makeBulkStringArray({"get", "foo"}),
+                          "$3\r\nbar\r\n", redis_client, fake_upstream_connection, "",
+                          "somepassword");
+
+  redis_client->close();
+  EXPECT_TRUE(fake_upstream_connection->close());
+}
+
+// V3: When read_policy is REPLICA, writes routed via CLUSTER NODES topology must go to the
+// primary and reads must go to the replica (with a READONLY command preceding the read).
+TEST_P(RedisClusterNodesWithReadPolicyIntegrationTest, SingleSlotPrimaryReplicaReadReplica) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                                  fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  // "foo" -> slot 12182; primary is upstream 0, replica is upstream 1.
+  // set goes to primary; get is routed to replica and preceded by READONLY.
+  simpleRequestAndResponse(0, makeBulkStringArray({"set", "foo", "bar"}), ":1\r\n", true);
+  simpleRequestAndResponse(1, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n", true);
+}
+
+// V4: After a cluster-down error the proxy triggers topology re-discovery.  When
+// redis_use_cluster_nodes is enabled that re-discovery connection must send CLUSTER NODES.
+TEST_P(RedisClusterNodesWithRefreshIntegrationTest, ClusterNodesRequestAfterFailure) {
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string response = singleSlotClusterNodes(fake_upstreams_[0]->localAddress()->ip(),
+                                                  fake_upstreams_[1]->localAddress()->ip());
+    expectCallClusterNodes(random_index_, response);
+  };
+
+  initialize();
+
+  std::string request = makeBulkStringArray({"get", "foo"});
+  std::string error_response = "-CLUSTERDOWN The cluster is down\r\n";
+  std::string upstream_error_response = "-upstream failure\r\n";
+  std::string cluster_nodes_request = makeBulkStringArray({"CLUSTER", "NODES"});
+  std::string proxy_to_server;
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  ASSERT_TRUE(redis_client->write(request));
+
+  FakeRawConnectionPtr fake_upstream_connection_1, fake_upstream_connection_2;
+
+  // Request routed to upstream 0, which responds with a cluster-down error.
+  EXPECT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_1));
+  EXPECT_TRUE(fake_upstream_connection_1->waitForData(request.size(), &proxy_to_server));
+  EXPECT_EQ(request, proxy_to_server);
+  proxy_to_server.clear();
+
+  EXPECT_TRUE(fake_upstream_connection_1->write(error_response));
+  redis_client->waitForData(upstream_error_response);
+  EXPECT_EQ(upstream_error_response, redis_client->data());
+
+  // Failure-triggered topology re-discovery must use CLUSTER NODES, not CLUSTER SLOTS.
+  EXPECT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_2));
+  EXPECT_TRUE(
+      fake_upstream_connection_2->waitForData(cluster_nodes_request.size(), &proxy_to_server));
+  EXPECT_EQ(cluster_nodes_request, proxy_to_server);
+
+  EXPECT_TRUE(fake_upstream_connection_1->close());
+  EXPECT_TRUE(fake_upstream_connection_2->close());
   redis_client->close();
 }
 
