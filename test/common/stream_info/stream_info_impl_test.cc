@@ -42,11 +42,11 @@ protected:
   void assertStreamInfoSize(StreamInfoImpl stream_info) {
     ASSERT_TRUE(
         // with --config=docker-msan
-        sizeof(stream_info) == 712 ||
+        sizeof(stream_info) == 728 ||
         // with --config=docker-clang
-        sizeof(stream_info) == 736 ||
+        sizeof(stream_info) == 752 ||
         // with --config=docker-clang-libc++
-        sizeof(stream_info) == 688)
+        sizeof(stream_info) == 704)
         << "If adding fields to StreamInfoImpl, please check to see if you "
            "need to add them to setFromForRecreateStream or setFrom! Current size "
         << sizeof(stream_info);
@@ -326,7 +326,7 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     EXPECT_TRUE(stream_info.healthCheck());
 
     EXPECT_EQ(nullptr, stream_info.route());
-    EXPECT_EQ(nullptr, stream_info.virtualHost());
+    EXPECT_FALSE(stream_info.virtualHost().has_value());
 
     std::shared_ptr<NiceMock<Router::MockVirtualHost>> vhost =
         std::make_shared<NiceMock<Router::MockVirtualHost>>();
@@ -334,7 +334,7 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     stream_info.vhost_ = vhost;
 
     // If the route is invalid then the vhost will be used.
-    EXPECT_EQ(vhost, stream_info.virtualHost());
+    EXPECT_EQ(vhost.get(), stream_info.virtualHost().ptr());
 
     std::shared_ptr<NiceMock<Router::MockRoute>> route =
         std::make_shared<NiceMock<Router::MockRoute>>();
@@ -380,6 +380,14 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     stream_info.setUpstreamInfo(new_info);
     EXPECT_EQ(stream_info.upstreamInfo(), new_info);
   }
+}
+
+TEST_F(StreamInfoImplTest, CodecStreamId) {
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
+  EXPECT_EQ(absl::nullopt, stream_info.codecStreamId());
+  stream_info.setCodecStreamId(12345);
+  EXPECT_EQ(12345, stream_info.codecStreamId());
 }
 
 TEST_F(StreamInfoImplTest, SetFromForRecreateStream) {

@@ -26,24 +26,25 @@ struct SupportedCommands {
     CONSTRUCT_ON_FIRST_USE(
         absl::flat_hash_set<std::string>, "append", "bf.add", "bf.card", "bf.exists", "bf.info",
         "bf.insert", "bf.loadchunk", "bf.madd", "bf.mexists", "bf.reserve", "bf.scandump",
-        "bitcount", "bitfield", "bitpos", "decr", "decrby", "dump", "expire", "expireat", "geoadd",
-        "geodist", "geohash", "geopos", "georadius_ro", "georadiusbymember_ro", "geosearch", "get",
-        "getbit", "getdel", "getex", "getrange", "getset", "hdel", "hexists", "hget", "hgetall",
-        "hincrby", "hincrbyfloat", "hkeys", "hlen", "hmget", "hmset", "hscan", "hset", "hsetnx",
-        "hstrlen", "hvals", "incr", "incrby", "incrbyfloat", "lindex", "linsert", "llen", "lmove",
-        "lpop", "lpush", "lpushx", "lrange", "lrem", "lset", "ltrim", "persist", "pexpire",
-        "pexpireat", "pfadd", "pfcount", "psetex", "pttl", "publish", "restore", "rpop", "rpush",
-        "rpushx", "sadd", "scard", "set", "setbit", "setex", "setnx", "setrange", "sismember",
-        "smembers", "spop", "srandmember", "srem", "sscan", "strlen", "ttl", "type", "xack", "xadd",
-        "xautoclaim", "xclaim", "xdel", "xlen", "xpending", "xrange", "xrevrange", "xtrim", "zadd",
-        "zcard", "zcount", "zincrby", "zlexcount", "zpopmin", "zpopmax", "zrange", "zrangebylex",
-        "zrangebyscore", "zrank", "zrem", "zremrangebylex", "zremrangebyrank", "zremrangebyscore",
-        "zrevrange", "zrevrangebylex", "zrevrangebyscore", "zrevrank", "zscan", "zscore", "copy",
-        "rpoplpush", "smove", "sunion", "sdiff", "sinter", "sinterstore", "zunionstore",
-        "zinterstore", "pfmerge", "georadius", "georadiusbymember", "rename", "sort", "sort_ro",
-        "zmscore", "sdiffstore", "msetnx", "substr", "zrangestore", "zunion", "zdiff",
-        "sunionstore", "smismember", "hrandfield", "geosearchstore", "zdiffstore", "zinter",
-        "zrandmember", "bitop", "lpos", "renamenx");
+        "bitcount", "bitfield", "bitfield_ro", "bitpos", "decr", "decrby", "dump", "expire",
+        "expireat", "geoadd", "geodist", "geohash", "geopos", "georadius_ro",
+        "georadiusbymember_ro", "geosearch", "get", "getbit", "getdel", "getex", "getrange",
+        "getset", "hdel", "hexists", "hget", "hgetall", "hincrby", "hincrbyfloat", "hkeys", "hlen",
+        "hmget", "hmset", "hscan", "hset", "hsetnx", "hstrlen", "hvals", "incr", "incrby",
+        "incrbyfloat", "lindex", "linsert", "llen", "lmove", "lpop", "lpush", "lpushx", "lrange",
+        "lrem", "lset", "ltrim", "persist", "pexpire", "pexpireat", "pfadd", "pfcount", "psetex",
+        "pttl", "publish", "restore", "rpop", "rpush", "rpushx", "sadd", "scard", "set", "setbit",
+        "setex", "setnx", "setrange", "sismember", "smembers", "spop", "srandmember", "srem",
+        "sscan", "strlen", "ttl", "type", "xack", "xadd", "xautoclaim", "xclaim", "xdel", "xlen",
+        "xpending", "xrange", "xrevrange", "xtrim", "zadd", "zcard", "zcount", "zincrby",
+        "zlexcount", "zpopmin", "zpopmax", "zrange", "zrangebylex", "zrangebyscore", "zrank",
+        "zrem", "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "zrevrange",
+        "zrevrangebylex", "zrevrangebyscore", "zrevrank", "zscan", "zscore", "copy", "rpoplpush",
+        "smove", "sunion", "sdiff", "sinter", "sinterstore", "zunionstore", "zinterstore",
+        "pfmerge", "georadius", "georadiusbymember", "rename", "sort", "sort_ro", "zmscore",
+        "sdiffstore", "msetnx", "substr", "zrangestore", "zunion", "zdiff", "sunionstore",
+        "smismember", "hrandfield", "geosearchstore", "zdiffstore", "zinter", "zrandmember",
+        "bitop", "lpos", "renamenx");
   }
 
   /**
@@ -62,6 +63,14 @@ struct SupportedCommands {
   }
 
   /**
+   * @return commands which hash on the third argument (subcommand key pattern)
+   * OBJECT subcommand key [arguments] -> key is at index 2
+   */
+  static const absl::flat_hash_set<std::string>& objectCommands() {
+    CONSTRUCT_ON_FIRST_USE(absl::flat_hash_set<std::string>, "object");
+  }
+
+  /**
    * @return commands which are sent to multiple servers and coalesced by summing the responses
    */
   static const absl::flat_hash_set<std::string>& hashMultipleSumResultCommands() {
@@ -74,7 +83,7 @@ struct SupportedCommands {
    */
   static const absl::flat_hash_set<std::string>& ClusterScopeCommands() {
     CONSTRUCT_ON_FIRST_USE(absl::flat_hash_set<std::string>, "script", "flushall", "flushdb",
-                           "slowlog", "config", "info", "keys", "select", "role");
+                           "slowlog", "config", "info", "keys", "select", "role", "hello");
   }
 
   /**
@@ -103,6 +112,11 @@ struct SupportedCommands {
     CONSTRUCT_ON_FIRST_USE(absl::flat_hash_set<std::string>, "multi", "exec", "discard", "watch",
                            "unwatch");
   }
+
+  /**
+   * @return hello command
+   */
+  static const std::string& hello() { CONSTRUCT_ON_FIRST_USE(std::string, "hello"); }
 
   /**
    * @return auth command
@@ -182,7 +196,8 @@ struct SupportedCommands {
                            "randomkey", // RANDOMKEY
                            "quit",      // QUIT
                            "role",      // ROLE
-                           "info"       // INFO [section]
+                           "info",      // INFO [section]
+                           "hello"      // HELLO [version]
     );
   }
 

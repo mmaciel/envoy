@@ -38,6 +38,8 @@
 #include "source/common/router/tls_context_match_criteria_impl.h"
 #include "source/common/stats/symbol_table.h"
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/types/optional.h"
 
@@ -105,6 +107,7 @@ public:
                                const StreamInfo::StreamInfo&, std::string&) const override {
     return EMPTY_STRING;
   };
+  absl::string_view responseContentType() const override { return EMPTY_STRING; }
 };
 
 class CommonVirtualHostImpl;
@@ -128,7 +131,8 @@ public:
   const envoy::config::core::v3::Metadata& metadata() const override { return metadata_; }
   const Envoy::Config::TypedMetadata& typedMetadata() const override { return typed_metadata_; }
   const std::string& routeName() const override { return EMPTY_STRING; }
-  const VirtualHostConstSharedPtr& virtualHost() const override { return virtual_host_; }
+  const VirtualHost& virtualHost() const override { return *virtual_host_; }
+  VirtualHostConstSharedPtr virtualHostSharedPtr() const override { return virtual_host_; }
 
 private:
   const VirtualHostConstSharedPtr virtual_host_;
@@ -389,7 +393,7 @@ private:
   std::shared_ptr<const SslRedirectRoute> ssl_redirect_route_;
   SslRequirements ssl_requirements_;
 
-  std::vector<RouteEntryImplBaseConstSharedPtr> routes_;
+  absl::InlinedVector<RouteEntryImplBaseConstSharedPtr, 2> routes_;
   Matcher::MatchTreeSharedPtr<Http::HttpMatchingData> matcher_;
 };
 
@@ -698,12 +702,8 @@ public:
     return getOptionalTimeout<OptionalTimeoutNames::GrpcTimeoutOffset>();
   }
 
-  const VirtualHostConstSharedPtr& virtualHost() const override {
-    // The method cannot return the vhost_ directly because the vhost_ has different type with
-    // the VirtualHostConstSharedPtr and will create a temporary copy implicitly and result in error
-    // of returning reference to local temporary object.
-    return vhost_copy_;
-  }
+  const VirtualHost& virtualHost() const override { return *vhost_; }
+  VirtualHostConstSharedPtr virtualHostSharedPtr() const override { return vhost_; }
   bool autoHostRewrite() const override { return auto_host_rewrite_; }
   bool appendXfh() const override { return append_xfh_; }
   const std::multimap<std::string, std::string>& opaqueConfig() const override {
@@ -736,6 +736,7 @@ public:
                                const Http::ResponseHeaderMap& response_headers,
                                const StreamInfo::StreamInfo& stream_info,
                                std::string& body_out) const override;
+  absl::string_view responseContentType() const override { return direct_response_content_type_; }
 
   // Router::Route
   const DirectResponseEntry* directResponseEntry() const override;
@@ -873,9 +874,6 @@ private:
   // Keep an copy of the shared pointer to the shared part of the virtual host. This is needed
   // to keep the shared part alive while the route is alive.
   const CommonVirtualHostSharedPtr vhost_;
-  // Same with vhost_ but this could be returned as reference. vhost_ is kept to access the
-  // methods that not exposed in the VirtualHost.
-  const VirtualHostConstSharedPtr vhost_copy_;
   const std::string cluster_name_;
   RouteStatsContextPtr route_stats_context_;
   ClusterSpecifierPluginSharedPtr cluster_specifier_plugin_;
@@ -891,6 +889,8 @@ private:
   std::vector<ShadowPolicyPtr> shadow_policies_;
   std::vector<Http::HeaderUtility::HeaderDataPtr> config_headers_;
   std::vector<ConfigUtility::QueryParameterMatcherPtr> config_query_parameters_;
+  std::vector<ConfigUtility::CookieMatcherPtr> config_cookies_;
+  absl::flat_hash_set<absl::string_view> config_cookie_names_;
 
   UpgradeMap upgrade_map_;
   std::unique_ptr<const Http::HashPolicyImpl> hash_policy_;
@@ -909,6 +909,7 @@ private:
   const RouteTracingConstPtr route_tracing_;
   Envoy::Config::DataSource::DataSourceProviderPtr<std::string> direct_response_body_provider_;
   Formatter::FormatterPtr direct_response_body_formatter_;
+  std::string direct_response_content_type_;
   std::unique_ptr<PerFilterConfigs> per_filter_configs_;
   const std::string route_name_;
   TimeSource& time_source_;

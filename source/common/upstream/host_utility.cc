@@ -46,6 +46,13 @@ void setHealthFlag(Upstream::Host::HealthFlag flag, const Host& host, std::strin
     break;
   }
 
+  case Host::HealthFlag::DEGRADED_OUTLIER_DETECTION: {
+    if (host.healthFlagGet(Host::HealthFlag::DEGRADED_OUTLIER_DETECTION)) {
+      health_status += "/degraded_outlier_detection";
+    }
+    break;
+  }
+
   case Host::HealthFlag::PENDING_DYNAMIC_REMOVAL: {
     if (host.healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL)) {
       health_status += "/pending_dynamic_removal";
@@ -168,15 +175,15 @@ void HostUtility::forEachHostMetric(
     const ClusterManager& cluster_manager,
     const std::function<void(Stats::PrimitiveCounterSnapshot&& metric)>& counter_cb,
     const std::function<void(Stats::PrimitiveGaugeSnapshot&& metric)>& gauge_cb) {
-  for (const auto& [unused_name, cluster_ref] : cluster_manager.clusters().active_clusters_) {
-    Upstream::ClusterInfoConstSharedPtr cluster_info = cluster_ref.get().info();
+  cluster_manager.forEachActiveCluster([&](const Cluster& cluster) {
+    Upstream::ClusterInfoConstSharedPtr cluster_info = cluster.info();
     if (cluster_info->perEndpointStatsEnabled()) {
       const std::string cluster_name =
           Stats::Utility::sanitizeStatsName(cluster_info->observabilityName());
 
       const Stats::TagVector& fixed_tags = cluster_info->statsScope().store().fixedTags();
 
-      for (auto& host_set : cluster_ref.get().prioritySet().hostSetsPerPriority()) {
+      for (auto& host_set : cluster.prioritySet().hostSetsPerPriority()) {
         for (auto& host : host_set->hosts()) {
 
           Stats::TagVector tags;
@@ -227,7 +234,7 @@ void HostUtility::forEachHostMetric(
         }
       }
     }
-  }
+  });
 }
 
 } // namespace Upstream
